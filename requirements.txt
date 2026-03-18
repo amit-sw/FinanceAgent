@@ -1,0 +1,8 @@
+streamlit
+yfinance 
+deepagents 
+langchain 
+langgraph 
+langchain-core 
+langchain-community 
+langchain-openai
