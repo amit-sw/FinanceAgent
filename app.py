@@ -6,9 +6,8 @@ This version is intentionally designed for teaching:
 - parallel visible agent panels for Fundamental, Technical, and Risk analysis
 - each agent panel shows:
   1. the request it received
-  2. the tool call it made
-  3. the tool response it received
-  4. the agent result it produced
+  2. the tool activity it produced, grouped into one expandable section
+  3. the agent result it produced
 - a final synthesis step combines the specialist outputs into one structured report
 
 Why this version does manual orchestration instead of hidden internal subagents:
@@ -20,6 +19,7 @@ log their tool interactions so students can see what happened.
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from contextvars import ContextVar
@@ -158,6 +158,275 @@ def _to_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# -----------------------------------------------------------------------------
+# Request normalization helpers
+# -----------------------------------------------------------------------------
+COMMON_QUERY_PREFIX_PATTERNS = (
+    r"^\s*tell me about\s+",
+    r"^\s*what can you tell me about\s+",
+    r"^\s*what do you think about\s+",
+    r"^\s*quick analysis on\s+",
+    r"^\s*quick take on\s+",
+    r"^\s*analysis on\s+",
+    r"^\s*analyze\s+",
+    r"^\s*research\s+",
+    r"^\s*look at\s+",
+    r"^\s*thoughts on\s+",
+    r"^\s*opinion on\s+",
+)
+
+US_EQUITY_EXCHANGE_MARKERS = (
+    "NYSE",
+    "NASDAQ",
+    "NMS",
+    "NGM",
+    "NCM",
+    "NYQ",
+    "ASE",
+    "AMEX",
+    "BATS",
+)
+
+NON_EQUITY_QUOTE_TYPES = {
+    "INDEX",
+    "CURRENCY",
+    "CRYPTOCURRENCY",
+    "OPTION",
+    "FUTURE",
+}
+
+
+def _normalize_ticker_symbol(value: str | None) -> str:
+    """Return a cleaned ticker symbol in uppercase."""
+    if not value:
+        return ""
+    return re.sub(r"[^A-Za-z0-9.\-]", "", value).upper()
+
+
+def _extract_company_search_term(user_query: str) -> str:
+    """Strip common prompt scaffolding so search sees the company phrase."""
+    cleaned = user_query.strip()
+    for pattern in COMMON_QUERY_PREFIX_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\([A-Za-z][A-Za-z0-9.\-]{0,9}\)", " ", cleaned)
+    cleaned = re.sub(
+        r"\b(?:buy|sell|hold|watch|bullish|bearish)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[-:|].*$", "", cleaned)
+    cleaned = re.sub(r"[?!.]+$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    return cleaned or user_query.strip()
+
+
+def _extract_explicit_ticker(user_query: str) -> str:
+    """Detect a ticker the user already supplied explicitly."""
+    paren_match = re.search(r"\(([A-Za-z][A-Za-z0-9.\-]{0,9})\)", user_query)
+    if paren_match:
+        return _normalize_ticker_symbol(paren_match.group(1))
+
+    dollar_match = re.search(r"\$([A-Za-z][A-Za-z0-9.\-]{0,9})\b", user_query)
+    if dollar_match:
+        return _normalize_ticker_symbol(dollar_match.group(1))
+
+    candidate = _extract_company_search_term(user_query).strip()
+    if (
+        candidate == candidate.upper()
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,5}", candidate)
+    ):
+        return _normalize_ticker_symbol(candidate)
+
+    return ""
+
+
+def _score_search_quote(quote: dict[str, Any], search_term: str) -> int:
+    """Score one Yahoo search result for use as the default equity match."""
+    symbol = _normalize_ticker_symbol(str(quote.get("symbol") or ""))
+    short_name = str(quote.get("shortname") or quote.get("shortName") or "")
+    long_name = str(quote.get("longname") or quote.get("longName") or "")
+    exchange = str(
+        quote.get("exchange")
+        or quote.get("exchDisp")
+        or quote.get("exchangeDisp")
+        or ""
+    )
+    quote_type = str(quote.get("quoteType") or quote.get("typeDisp") or "").upper()
+
+    names_blob = " ".join(part for part in (short_name, long_name) if part).lower()
+    search_lower = search_term.lower()
+    tokens = re.findall(r"[A-Za-z0-9]+", search_lower)
+
+    score = 0
+    if symbol == _normalize_ticker_symbol(search_term):
+        score += 120
+
+    if quote_type == "EQUITY":
+        score += 60
+    elif quote_type in NON_EQUITY_QUOTE_TYPES:
+        score -= 80
+    elif quote_type:
+        score += 10
+
+    if exchange and any(marker in exchange.upper() for marker in US_EQUITY_EXCHANGE_MARKERS):
+        score += 20
+    if "OTC" in exchange.upper():
+        score -= 30
+
+    if search_lower and search_lower == short_name.lower():
+        score += 40
+    if search_lower and search_lower == long_name.lower():
+        score += 40
+    if search_lower and search_lower in names_blob:
+        score += 25
+
+    token_overlap = sum(1 for token in tokens if token in names_blob)
+    score += min(token_overlap * 6, 24)
+
+    return score
+
+
+def _search_yahoo_symbol(search_term: str) -> dict[str, Any] | None:
+    """Best-effort company-to-ticker lookup using yfinance search when available."""
+    search_cls = getattr(yf, "Search", None)
+    if search_cls is None or not search_term:
+        return None
+
+    try:
+        try:
+            search_result = search_cls(search_term, max_results=8)
+        except TypeError:
+            search_result = search_cls(search_term)
+        quotes = getattr(search_result, "quotes", None) or []
+    except Exception as exc:
+        logger.warning("Yahoo search failed for query %s: %s", search_term, exc)
+        return None
+
+    best_quote = None
+    best_score = float("-inf")
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            continue
+        score = _score_search_quote(quote, search_term)
+        if score > best_score:
+            best_score = score
+            best_quote = quote
+
+    if not isinstance(best_quote, dict) or best_score < 45:
+        return None
+
+    return {
+        "ticker": _normalize_ticker_symbol(str(best_quote.get("symbol") or "")),
+        "company_name": (
+            best_quote.get("shortname")
+            or best_quote.get("shortName")
+            or best_quote.get("longname")
+            or best_quote.get("longName")
+            or ""
+        ),
+        "exchange": (
+            best_quote.get("exchange")
+            or best_quote.get("exchDisp")
+            or best_quote.get("exchangeDisp")
+            or ""
+        ),
+        "quote_type": best_quote.get("quoteType") or best_quote.get("typeDisp") or "",
+        "score": best_score,
+    }
+
+
+def build_agent_request_context(user_query: str) -> dict[str, Any]:
+    """Resolve the likely stock target once and reuse it across all agents."""
+    original_query = user_query.strip()
+    search_term = _extract_company_search_term(original_query)
+    explicit_ticker = _extract_explicit_ticker(original_query)
+
+    context: dict[str, Any] = {
+        "original_user_query": original_query,
+        "search_term": search_term,
+        "resolved_ticker": "",
+        "resolved_company_name": "",
+        "resolution_status": "unresolved",
+        "resolution_confidence": "low",
+        "resolution_note": (
+            "No explicit ticker was found in the request, and no best-effort match has been confirmed yet."
+        ),
+    }
+
+    if explicit_ticker:
+        context.update(
+            {
+                "resolved_ticker": explicit_ticker,
+                "resolution_status": "explicit_ticker",
+                "resolution_confidence": "high",
+                "resolution_note": (
+                    f"The user explicitly supplied ticker {explicit_ticker}."
+                ),
+            }
+        )
+        return context
+
+    best_match = _search_yahoo_symbol(search_term)
+    if best_match and best_match.get("ticker"):
+        company_name = str(best_match.get("company_name") or "").strip()
+        ticker = str(best_match["ticker"])
+        context.update(
+            {
+                "resolved_ticker": ticker,
+                "resolved_company_name": company_name,
+                "resolution_status": "best_effort_equity_match",
+                "resolution_confidence": "medium",
+                "resolution_note": (
+                    f'Using "{ticker}" as the best-matching public equity for "{search_term}"'
+                    + (
+                        f' based on Yahoo search result "{company_name}".'
+                        if company_name
+                        else "."
+                    )
+                ),
+            }
+        )
+
+    return context
+
+
+def format_specialist_user_message(request_context: dict[str, Any]) -> str:
+    """Create the user message specialists receive after request normalization."""
+    original_query = str(request_context.get("original_user_query") or "")
+    search_term = str(request_context.get("search_term") or "")
+    ticker = str(request_context.get("resolved_ticker") or "")
+    company_name = str(request_context.get("resolved_company_name") or "")
+    resolution_status = str(request_context.get("resolution_status") or "unresolved")
+    resolution_note = str(request_context.get("resolution_note") or "")
+
+    lines = [
+        f"Original user request: {original_query}",
+        f"Search term: {search_term or original_query}",
+        f"Resolution status: {resolution_status}",
+        f"Resolution note: {resolution_note}",
+    ]
+
+    if ticker:
+        lines.extend(
+            [
+                f"Resolved ticker: {ticker}",
+                f"Resolved company name: {company_name or 'Unknown'}",
+                (
+                    "Treat this as a stock research request about the resolved ticker. "
+                    "Use that ticker unless tool output clearly contradicts it."
+                ),
+            ]
+        )
+    else:
+        lines.append(
+            "Make a best-effort finance-oriented assumption before asking the user for clarification."
+        )
+
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------
@@ -514,6 +783,12 @@ Pedagogical requirements:
 - prefer clarity over brevity
 - state missing data explicitly
 - produce structured output that matches the requested schema exactly
+
+Entity resolution rules:
+- this is a stock research app, so default to the most likely public equity when the user names a company without a ticker
+- if the request payload includes a resolved ticker, use it instead of asking the user to clarify
+- only ask for clarification after tools fail or the request payload says resolution is unresolved
+- do not leave the ticker blank when a reasonable best-effort public-equity mapping is available
 """
 
 
@@ -604,16 +879,17 @@ def get_synthesis_agent():
 async def run_specialist_agent(
     agent_name: str,
     instructions: str,
-    user_query: str,
+    request_context: dict[str, Any],
     thread_id: str,
 ) -> SpecialistReport:
     """Run one specialist agent and capture visible logs for its panel."""
-    add_agent_log(agent_name, "request", user_query)
+    add_agent_log(agent_name, "request", request_context)
     token = CURRENT_AGENT_NAME.set(agent_name)
     try:
         agent = get_specialist_agent(agent_name, instructions)
+        user_message = format_specialist_user_message(request_context)
         final_result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_query}]},
+            {"messages": [{"role": "user", "content": user_message}]},
             config={"configurable": {"thread_id": thread_id}},
         )
         structured = final_result.get("structured_response")
@@ -625,6 +901,9 @@ async def run_specialist_agent(
             raise ValueError(
                 f"{agent_name} did not return a structured SpecialistReport."
             )
+        resolved_ticker = str(request_context.get("resolved_ticker") or "")
+        if resolved_ticker and not report.ticker:
+            report = report.model_copy(update={"ticker": resolved_ticker})
         add_agent_log(agent_name, "result", report.model_dump())
         return report
     finally:
@@ -632,14 +911,15 @@ async def run_specialist_agent(
 
 
 async def run_synthesis_agent(
-    user_query: str,
+    request_context: dict[str, Any],
     specialist_reports: list[SpecialistReport],
     thread_id: str,
 ) -> StockResearchReport:
     """Combine specialist outputs into one final structured report."""
     agent_name = "Synthesis Agent"
     synthesis_payload = {
-        "original_user_request": user_query,
+        "original_user_request": request_context.get("original_user_query", ""),
+        "request_context": request_context,
         "specialist_reports": [report.model_dump() for report in specialist_reports],
         "instruction": (
             "Combine the specialist reports into one balanced final report. "
@@ -663,6 +943,15 @@ async def run_synthesis_agent(
             raise ValueError(
                 "Synthesis Agent did not return a structured StockResearchReport."
             )
+        resolved_ticker = str(request_context.get("resolved_ticker") or "")
+        resolved_company_name = str(request_context.get("resolved_company_name") or "")
+        if resolved_ticker and not report.ticker:
+            report = report.model_copy(
+                update={
+                    "ticker": resolved_ticker,
+                    "company_name": report.company_name or resolved_company_name or None,
+                }
+            )
         add_agent_log(agent_name, "result", report.model_dump())
         return report
     finally:
@@ -672,30 +961,31 @@ async def run_synthesis_agent(
 async def run_full_workflow(user_query: str) -> StockResearchReport:
     """Run three specialist agents in parallel, then synthesize their results."""
     base_thread = f"stock-research-{uuid4()}"
+    request_context = build_agent_request_context(user_query)
 
     specialist_tasks = [
         run_specialist_agent(
             agent_name="Fundamental Agent",
             instructions=FUNDAMENTAL_INSTRUCTIONS,
-            user_query=user_query,
+            request_context=request_context,
             thread_id=f"{base_thread}-fundamental",
         ),
         run_specialist_agent(
             agent_name="Technical Agent",
             instructions=TECHNICAL_INSTRUCTIONS,
-            user_query=user_query,
+            request_context=request_context,
             thread_id=f"{base_thread}-technical",
         ),
         run_specialist_agent(
             agent_name="Risk Agent",
             instructions=RISK_INSTRUCTIONS,
-            user_query=user_query,
+            request_context=request_context,
             thread_id=f"{base_thread}-risk",
         ),
     ]
     specialist_reports = await asyncio.gather(*specialist_tasks)
     final_report = await run_synthesis_agent(
-        user_query=user_query,
+        request_context=request_context,
         specialist_reports=specialist_reports,
         thread_id=f"{base_thread}-synthesis",
     )
@@ -705,6 +995,75 @@ async def run_full_workflow(user_query: str) -> StockResearchReport:
 # Streamlit rendering helpers
 # -----------------------------------------------------------------------------
 
+def _render_payload(payload: Any) -> None:
+    """Render one event payload consistently."""
+    if isinstance(payload, dict):
+        st.json(payload)
+    else:
+        st.text(str(payload))
+
+
+def _group_tool_activity(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair tool calls and responses into a single ordered activity list."""
+    interactions: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload")
+        tool_name = payload.get("tool_name") if isinstance(payload, dict) else None
+
+        if event.get("kind") == "tool_call":
+            interactions.append(
+                {
+                    "tool_name": tool_name,
+                    "call": payload,
+                    "response": None,
+                }
+            )
+            continue
+
+        if event.get("kind") == "tool_response":
+            if (
+                interactions
+                and interactions[-1]["response"] is None
+                and interactions[-1]["tool_name"] == tool_name
+            ):
+                interactions[-1]["response"] = payload
+            else:
+                interactions.append(
+                    {
+                        "tool_name": tool_name,
+                        "call": None,
+                        "response": payload,
+                    }
+                )
+    return interactions
+
+
+def _render_tool_activity(interactions: list[dict[str, Any]]) -> None:
+    """Render grouped tool activity without one expander per tool event."""
+    for idx, interaction in enumerate(interactions, start=1):
+        tool_name = interaction["tool_name"] or "Tool"
+        st.markdown(f"**{idx}. {tool_name}**")
+
+        call_payload = interaction["call"]
+        if call_payload is not None:
+            st.caption("Arguments")
+            if isinstance(call_payload, dict):
+                _render_payload(call_payload.get("arguments", call_payload))
+            else:
+                _render_payload(call_payload)
+
+        response_payload = interaction["response"]
+        if response_payload is not None:
+            st.caption("Response")
+            if isinstance(response_payload, dict):
+                _render_payload(response_payload.get("response", response_payload))
+            else:
+                _render_payload(response_payload)
+
+        if idx < len(interactions):
+            st.divider()
+
+
 def render_events_into_container(container, agent_name: str, events: list[dict[str, Any]]) -> None:
     """Render a list of agent events into the given Streamlit container."""
     with container.container():
@@ -713,30 +1072,46 @@ def render_events_into_container(container, agent_name: str, events: list[dict[s
             st.caption("No activity yet.")
             return
 
-        for event in events:
-            kind = event["kind"]
-            payload = event["payload"]
-            if kind == "request":
-                with st.expander("Request received", expanded=False):
-                    if isinstance(payload, dict):
-                        st.json(payload)
-                    else:
-                        st.text(str(payload))
-            elif kind == "tool_call":
-                with st.expander("Tool call", expanded=False):
-                    st.json(payload)
-            elif kind == "tool_response":
-                with st.expander("Tool response", expanded=False):
-                    st.json(payload)
-            elif kind == "result":
-                with st.expander("Agent result", expanded=False):
-                    st.json(payload)
-            else:
-                with st.expander(kind, expanded=False):
-                    if isinstance(payload, dict):
-                        st.json(payload)
-                    else:
-                        st.text(str(payload))
+        request_events = [event for event in events if event.get("kind") == "request"]
+        tool_events = [
+            event
+            for event in events
+            if event.get("kind") in {"tool_call", "tool_response"}
+        ]
+        result_events = [event for event in events if event.get("kind") == "result"]
+        other_events = [
+            event
+            for event in events
+            if event.get("kind") not in {"request", "tool_call", "tool_response", "result"}
+        ]
+
+        if request_events:
+            with st.expander("Request received", expanded=False):
+                for idx, event in enumerate(request_events, start=1):
+                    if len(request_events) > 1:
+                        st.markdown(f"**{idx}. Request**")
+                    _render_payload(event.get("payload"))
+                    if idx < len(request_events):
+                        st.divider()
+
+        tool_activity = _group_tool_activity(tool_events)
+        if tool_activity:
+            with st.expander(f"Tool activity ({len(tool_activity)})", expanded=False):
+                _render_tool_activity(tool_activity)
+
+        if result_events:
+            with st.expander("Agent result", expanded=False):
+                for idx, event in enumerate(result_events, start=1):
+                    if len(result_events) > 1:
+                        st.markdown(f"**{idx}. Result**")
+                    _render_payload(event.get("payload"))
+                    if idx < len(result_events):
+                        st.divider()
+
+        for event in other_events:
+            kind = event.get("kind", "event")
+            with st.expander(kind.replace("_", " ").title(), expanded=False):
+                _render_payload(event.get("payload"))
 
 
 def render_live_agent_panels(panel_map: dict[str, Any]) -> None:
@@ -828,7 +1203,7 @@ def main() -> None:
     st.title("Pedagogical Deep Agent Stock Research App")
     st.caption(
         "Main chat on the left. Parallel visible agent panels on the right. "
-        "Each panel shows the request, tool calls, tool responses, and final agent result."
+        "Each panel shows the request, grouped tool activity, and the final agent result."
     )
 
     left_col, right_col = st.columns([1.2, 1.8], gap="large")
